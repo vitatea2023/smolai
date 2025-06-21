@@ -5,6 +5,7 @@ const fs = require('fs');
 const https = require('https');
 const http = require('http');
 const TurndownService = require('turndown');
+const TencentTranslator = require('./tencent-translator');
 
 // Create turndown service instance with fenced code block style
 const turndownService = new TurndownService({
@@ -32,6 +33,21 @@ function parseArgs() {
       i++;
     } else if (args[i] === '--translate') {
       params.translate = true;
+    } else if (args[i] === '--secret-id' && i + 1 < args.length) {
+      params.secretId = args[i + 1];
+      i++;
+    } else if (args[i] === '--secret-key' && i + 1 < args.length) {
+      params.secretKey = args[i + 1];
+      i++;
+    } else if (args[i] === '--target-lang' && i + 1 < args.length) {
+      params.targetLang = args[i + 1];
+      i++;
+    } else if (args[i] === '--source-lang' && i + 1 < args.length) {
+      params.sourceLang = args[i + 1];
+      i++;
+    } else if (args[i] === '--region' && i + 1 < args.length) {
+      params.region = args[i + 1];
+      i++;
     }
   }
   
@@ -161,16 +177,59 @@ function segmentText(markdown) {
   return segments;
 }
 
-// Process segments with translation markers
-function processSegments(segments, enableTranslation = false) {
+// Process segments with translation markers or actual translation
+async function processSegments(segments, enableTranslation = false, translator = null, sourceLang = 'auto', targetLang = 'en') {
   let result = '';
   
-  for (const segment of segments) {
-    if (segment.needsTranslation && enableTranslation) {
-      result += segment.content + '\n';
-      result += '\n<!-- [TRANSLATION_PLACEHOLDER] -->\n\n';
+  if (enableTranslation && translator) {
+    // Extract translatable texts for batch translation
+    const translatableTexts = segments
+      .filter(segment => segment.needsTranslation)
+      .map(segment => segment.content);
+    
+    if (translatableTexts.length > 0) {
+      console.log(`Translating ${translatableTexts.length} text segments...`);
+      try {
+        const translations = await translator.translateBatch(translatableTexts, sourceLang, targetLang);
+        
+        let translationIndex = 0;
+        for (const segment of segments) {
+          if (segment.needsTranslation) {
+            result += segment.content + '\n\n';
+            result += translations[translationIndex] + '\n\n';
+            translationIndex++;
+          } else {
+            result += segment.content + '\n';
+          }
+        }
+      } catch (error) {
+        console.error('Translation failed:', error.message);
+        console.log('Falling back to translation placeholders...');
+        // Fallback to placeholder mode
+        for (const segment of segments) {
+          if (segment.needsTranslation) {
+            result += segment.content + '\n';
+            result += '\n<!-- [TRANSLATION_PLACEHOLDER] -->\n\n';
+          } else {
+            result += segment.content + '\n';
+          }
+        }
+      }
     } else {
-      result += segment.content + '\n';
+      // No translatable content found
+      for (const segment of segments) {
+        result += segment.content + '\n';
+      }
+    }
+  } else {
+    // Original placeholder mode
+    for (const segment of segments) {
+      if (segment.needsTranslation && enableTranslation) {
+        result += segment.content + '\n';
+        result += '\n<!-- [TRANSLATION_PLACEHOLDER] -->\n\n';
+      } else {
+        result += segment.content + '\n';
+      }
     }
   }
   
@@ -178,7 +237,7 @@ function processSegments(segments, enableTranslation = false) {
 }
 
 // Convert HTML to Markdown
-function convertToMarkdown(html, enableTranslation = false) {
+async function convertToMarkdown(html, enableTranslation = false, translator = null, sourceLang = 'auto', targetLang = 'en') {
   // Clean HTML first
   const cleanedHTML = cleanHTML(html);
   
@@ -195,7 +254,7 @@ function convertToMarkdown(html, enableTranslation = false) {
   // If translation is enabled, segment and process the text
   if (enableTranslation) {
     const segments = segmentText(markdown);
-    markdown = processSegments(segments, enableTranslation);
+    markdown = await processSegments(segments, enableTranslation, translator, sourceLang, targetLang);
   }
 
   return markdown;
@@ -203,26 +262,44 @@ function convertToMarkdown(html, enableTranslation = false) {
 
 // Main function
 async function main() {
-  const { url, output, translate } = parseArgs();
+  const { url, output, translate, secretId, secretKey, targetLang, sourceLang, region } = parseArgs();
   
   if (!url) {
     console.error('Error: Please provide --url parameter');
-    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE> [--translate]');
+    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE> [--translate] [--secret-id <ID>] [--secret-key <KEY>] [--target-lang <LANG>] [--source-lang <LANG>] [--region <REGION>]');
     process.exit(1);
   }
   
   if (!output) {
     console.error('Error: Please provide --output parameter');
-    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE> [--translate]');
+    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE> [--translate] [--secret-id <ID>] [--secret-key <KEY>] [--target-lang <LANG>] [--source-lang <LANG>] [--region <REGION>]');
     process.exit(1);
+  }
+  
+  // Initialize translator if credentials are provided
+  let translator = null;
+  if (translate && secretId && secretKey) {
+    translator = new TencentTranslator(secretId, secretKey, region || 'ap-singapore');
+    console.log(`Tencent Cloud translator initialized (region: ${region || 'ap-singapore'})`);
+  } else if (translate) {
+    console.log('Translation mode: placeholder only (no API credentials provided)');
   }
   
   try {
     console.log(`Downloading: ${url}`);
     const html = await fetchHTML(url);
     
-    console.log(`Converting to Markdown${translate ? ' with translation markers' : ''}...`);
-    let markdown = convertToMarkdown(html, translate);
+    const translationMode = translator ? 'with Tencent Cloud translation' : 
+                          translate ? 'with translation placeholders' : '';
+    console.log(`Converting to Markdown ${translationMode}...`);
+    
+    let markdown = await convertToMarkdown(
+      html, 
+      translate, 
+      translator, 
+      sourceLang || 'auto', 
+      targetLang || 'zh'
+    );
     
     console.log(`Saving to: ${output}`);
     // Ensure file ends with newline
@@ -232,8 +309,13 @@ async function main() {
     fs.writeFileSync(output, markdown, 'utf8');
     
     if (translate) {
-      console.log('Conversion completed with translation placeholders!');
-      console.log('Translation placeholders: <!-- [TRANSLATION_PLACEHOLDER] -->');
+      if (translator) {
+        console.log('Conversion completed with Tencent Cloud translation!');
+      } else {
+        console.log('Conversion completed with translation placeholders!');
+        console.log('Translation placeholders: <!-- [TRANSLATION_PLACEHOLDER] -->');
+        console.log('To enable actual translation, provide --secret-id and --secret-key parameters');
+      }
     } else {
       console.log('Conversion completed!');
     }
