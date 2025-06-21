@@ -30,6 +30,8 @@ function parseArgs() {
     } else if (args[i] === '--output' && i + 1 < args.length) {
       params.output = args[i + 1];
       i++;
+    } else if (args[i] === '--translate') {
+      params.translate = true;
     }
   }
   
@@ -76,8 +78,107 @@ function cleanHTML(html) {
   return html;
 }
 
+// Segment text into translatable chunks
+function segmentText(markdown) {
+  const segments = [];
+  const lines = markdown.split('\n');
+  let currentSegment = '';
+  let inCodeBlock = false;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmedLine = line.trim();
+    
+    // Track code blocks
+    if (trimmedLine.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+    }
+    
+    // Define what should NOT be translated
+    const isNonTranslatable = !trimmedLine || 
+      inCodeBlock ||
+      trimmedLine.startsWith('#') ||
+      trimmedLine.startsWith('```') ||
+      trimmedLine.startsWith('---') ||
+      trimmedLine.startsWith('*   ') ||
+      trimmedLine.startsWith('- ') ||
+      trimmedLine.match(/^\[[\s\S]*?\]\([\s\S]*?\)$/) ||
+      trimmedLine.match(/^\d+→/) ||
+      trimmedLine.match(/^={3,}$/) ||
+      trimmedLine.match(/^[^a-zA-Z]*$/) ||  // Lines with no letters (symbols, numbers only)
+      trimmedLine.length < 10;  // Very short lines are likely markup
+    
+    if (isNonTranslatable) {
+      // If we have accumulated text, save it as a segment
+      if (currentSegment.trim()) {
+        segments.push({
+          type: 'text',
+          content: currentSegment.trim(),
+          needsTranslation: true
+        });
+        currentSegment = '';
+      }
+      
+      // Add the non-translatable line as-is
+      segments.push({
+        type: 'markup',
+        content: line,
+        needsTranslation: false
+      });
+    } else {
+      // This line looks like translatable content
+      currentSegment += line + '\n';
+      
+      // Check if this is the end of a paragraph
+      const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+      const isEndOfParagraph = !nextLine || 
+        nextLine.startsWith('#') || 
+        nextLine.startsWith('*') ||
+        nextLine.startsWith('-') ||
+        nextLine.startsWith('```') ||
+        nextLine.match(/^\[[\s\S]*?\]\([\s\S]*?\)$/);
+      
+      if (isEndOfParagraph && currentSegment.trim()) {
+        segments.push({
+          type: 'text',
+          content: currentSegment.trim(),
+          needsTranslation: true
+        });
+        currentSegment = '';
+      }
+    }
+  }
+  
+  // Add any remaining text
+  if (currentSegment.trim()) {
+    segments.push({
+      type: 'text',
+      content: currentSegment.trim(),
+      needsTranslation: true
+    });
+  }
+  
+  return segments;
+}
+
+// Process segments with translation markers
+function processSegments(segments, enableTranslation = false) {
+  let result = '';
+  
+  for (const segment of segments) {
+    if (segment.needsTranslation && enableTranslation) {
+      result += segment.content + '\n';
+      result += '\n<!-- [TRANSLATION_PLACEHOLDER] -->\n\n';
+    } else {
+      result += segment.content + '\n';
+    }
+  }
+  
+  return result;
+}
+
 // Convert HTML to Markdown
-function convertToMarkdown(html) {
+function convertToMarkdown(html, enableTranslation = false) {
   // Clean HTML first
   const cleanedHTML = cleanHTML(html);
   
@@ -91,22 +192,28 @@ function convertToMarkdown(html) {
     return decodeUTF8Sequence(sequence);
   });
 
+  // If translation is enabled, segment and process the text
+  if (enableTranslation) {
+    const segments = segmentText(markdown);
+    markdown = processSegments(segments, enableTranslation);
+  }
+
   return markdown;
 }
 
 // Main function
 async function main() {
-  const { url, output } = parseArgs();
+  const { url, output, translate } = parseArgs();
   
   if (!url) {
     console.error('Error: Please provide --url parameter');
-    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE>');
+    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE> [--translate]');
     process.exit(1);
   }
   
   if (!output) {
     console.error('Error: Please provide --output parameter');
-    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE>');
+    console.log('Usage: node html-to-markdown.js --url <URL> --output <OUTPUT_FILE> [--translate]');
     process.exit(1);
   }
   
@@ -114,8 +221,8 @@ async function main() {
     console.log(`Downloading: ${url}`);
     const html = await fetchHTML(url);
     
-    console.log('Converting to Markdown...');
-    let markdown = convertToMarkdown(html);
+    console.log(`Converting to Markdown${translate ? ' with translation markers' : ''}...`);
+    let markdown = convertToMarkdown(html, translate);
     
     console.log(`Saving to: ${output}`);
     // Ensure file ends with newline
@@ -124,7 +231,12 @@ async function main() {
     }
     fs.writeFileSync(output, markdown, 'utf8');
     
-    console.log('Conversion completed!');
+    if (translate) {
+      console.log('Conversion completed with translation placeholders!');
+      console.log('Translation placeholders: <!-- [TRANSLATION_PLACEHOLDER] -->');
+    } else {
+      console.log('Conversion completed!');
+    }
   } catch (error) {
     console.error('Error occurred:', error.message);
     process.exit(1);
