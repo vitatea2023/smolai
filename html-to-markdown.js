@@ -113,16 +113,13 @@ function segmentText(markdown) {
     // Define what should NOT be translated
     const isNonTranslatable = !trimmedLine || 
       inCodeBlock ||
-      trimmedLine.startsWith('#') ||
       trimmedLine.startsWith('```') ||
       trimmedLine.startsWith('---') ||
-      trimmedLine.startsWith('*   ') ||
-      trimmedLine.startsWith('- ') ||
-      trimmedLine.match(/^\[[\s\S]*?\]\([\s\S]*?\)$/) ||
-      trimmedLine.match(/^\d+→/) ||
-      trimmedLine.match(/^={3,}$/) ||
-      trimmedLine.match(/^[^a-zA-Z]*$/) ||  // Lines with no letters (symbols, numbers only)
-      trimmedLine.length < 10;  // Very short lines are likely markup
+      trimmedLine.match(/^\[[\s\S]*?\]\([\s\S]*?\)$/) ||  // Pure links
+      trimmedLine.match(/^\d+→/) ||  // Line numbers
+      trimmedLine.match(/^={3,}$/) ||  // Separators
+      trimmedLine.match(/^[^a-zA-Z\u4e00-\u9fff]*$/) ||  // Lines with no letters (symbols, numbers only)
+      trimmedLine.length < 3;  // Only skip very short lines (< 3 chars)
     
     if (isNonTranslatable) {
       // If we have accumulated text, save it as a segment
@@ -143,24 +140,45 @@ function segmentText(markdown) {
       });
     } else {
       // This line looks like translatable content
-      currentSegment += line + '\n';
+      const isListItem = trimmedLine.match(/^[*-]\s/);
       
-      // Check if this is the end of a paragraph
-      const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
-      const isEndOfParagraph = !nextLine || 
-        nextLine.startsWith('#') || 
-        nextLine.startsWith('*') ||
-        nextLine.startsWith('-') ||
-        nextLine.startsWith('```') ||
-        nextLine.match(/^\[[\s\S]*?\]\([\s\S]*?\)$/);
-      
-      if (isEndOfParagraph && currentSegment.trim()) {
+      if (isListItem) {
+        // If we have accumulated text, save it first
+        if (currentSegment.trim()) {
+          segments.push({
+            type: 'text',
+            content: currentSegment.trim(),
+            needsTranslation: true
+          });
+          currentSegment = '';
+        }
+        
+        // Treat each list item as a separate translatable segment
         segments.push({
           type: 'text',
-          content: currentSegment.trim(),
+          content: line,
           needsTranslation: true
         });
-        currentSegment = '';
+      } else {
+        // Regular text content
+        currentSegment += line + '\n';
+        
+        // Check if this is the end of a paragraph
+        const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+        const isEndOfParagraph = !nextLine || 
+          nextLine.startsWith('#') || 
+          nextLine.startsWith('```') ||
+          nextLine.match(/^\[[\s\S]*?\]\([\s\S]*?\)$/) ||
+          nextLine.match(/^[*-]\s/);  // Next line is a list item
+        
+        if (isEndOfParagraph && currentSegment.trim()) {
+          segments.push({
+            type: 'text',
+            content: currentSegment.trim(),
+            needsTranslation: true
+          });
+          currentSegment = '';
+        }
       }
     }
   }
@@ -182,23 +200,43 @@ async function processSegments(segments, enableTranslation = false, translator =
   let result = '';
   
   if (enableTranslation && translator) {
-    // Extract translatable texts for batch translation
-    const translatableTexts = segments
-      .filter(segment => segment.needsTranslation)
-      .map(segment => segment.content);
+    // Separate translatable texts and handle titles differently
+    const translatableSegments = segments.filter(segment => segment.needsTranslation);
+    const titleSegments = segments.filter(segment => 
+      !segment.needsTranslation && 
+      segment.content.trim().startsWith('#') &&
+      segment.content.trim().match(/[a-zA-Z\u4e00-\u9fff]/)  // Contains letters
+    );
     
-    if (translatableTexts.length > 0) {
-      console.log(`Translating ${translatableTexts.length} text segments...`);
+    // Collect all texts that need translation (including titles)
+    const allTextsToTranslate = [
+      ...translatableSegments.map(segment => segment.content),
+      ...titleSegments.map(segment => segment.content.replace(/^#+\s*/, '').trim())  // Remove # markers for translation
+    ];
+    
+    if (allTextsToTranslate.length > 0) {
+      console.log(`Translating ${translatableSegments.length} text segments and ${titleSegments.length} titles...`);
       try {
-        const translations = await translator.translateBatch(translatableTexts, sourceLang, targetLang);
+        const translations = await translator.translateBatch(allTextsToTranslate, sourceLang, targetLang);
         
         let translationIndex = 0;
+        let titleTranslationIndex = translatableSegments.length;
+        
         for (const segment of segments) {
           if (segment.needsTranslation) {
+            // Regular translatable content
             result += segment.content + '\n\n';
             result += translations[translationIndex] + '\n\n';
             translationIndex++;
+          } else if (segment.content.trim().startsWith('#') && 
+                     segment.content.trim().match(/[a-zA-Z\u4e00-\u9fff]/)) {
+            // Title that needs translation
+            const titleLevel = segment.content.match(/^#+/)[0];
+            result += segment.content + '\n\n';
+            result += titleLevel + ' ' + translations[titleTranslationIndex] + '\n\n';
+            titleTranslationIndex++;
           } else {
+            // Non-translatable content (code, links, etc.)
             result += segment.content + '\n';
           }
         }
@@ -210,6 +248,10 @@ async function processSegments(segments, enableTranslation = false, translator =
           if (segment.needsTranslation) {
             result += segment.content + '\n';
             result += '\n<!-- [TRANSLATION_PLACEHOLDER] -->\n\n';
+          } else if (segment.content.trim().startsWith('#') && 
+                     segment.content.trim().match(/[a-zA-Z\u4e00-\u9fff]/)) {
+            result += segment.content + '\n';
+            result += '\n<!-- [TITLE_TRANSLATION_PLACEHOLDER] -->\n\n';
           } else {
             result += segment.content + '\n';
           }
@@ -217,6 +259,7 @@ async function processSegments(segments, enableTranslation = false, translator =
       }
     } else {
       // No translatable content found
+      console.log('No translatable content found');
       for (const segment of segments) {
         result += segment.content + '\n';
       }
@@ -227,6 +270,10 @@ async function processSegments(segments, enableTranslation = false, translator =
       if (segment.needsTranslation && enableTranslation) {
         result += segment.content + '\n';
         result += '\n<!-- [TRANSLATION_PLACEHOLDER] -->\n\n';
+      } else if (enableTranslation && segment.content.trim().startsWith('#') && 
+                 segment.content.trim().match(/[a-zA-Z\u4e00-\u9fff]/)) {
+        result += segment.content + '\n';
+        result += '\n<!-- [TITLE_TRANSLATION_PLACEHOLDER] -->\n\n';
       } else {
         result += segment.content + '\n';
       }

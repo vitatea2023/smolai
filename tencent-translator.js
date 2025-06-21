@@ -124,14 +124,98 @@ class TencentTranslator {
     });
   }
 
+  // Smart text splitting to preserve meaning
+  splitLongText(text, maxLength = 1000) {
+    if (text.length <= maxLength) {
+      return [text];
+    }
+    
+    const segments = [];
+    let remaining = text;
+    
+    while (remaining.length > maxLength) {
+      let splitPoint = maxLength;
+      
+      // Try to find good split points (in order of preference)
+      const splitPatterns = [
+        /\. /g,           // Sentence end
+        /\? /g,           // Question end  
+        /! /g,            // Exclamation end
+        /; /g,            // Semicolon
+        /, /g,            // Comma
+        / - /g,           // Dash
+        / /g              // Any space
+      ];
+      
+      for (const pattern of splitPatterns) {
+        const matches = [...remaining.substring(0, maxLength).matchAll(pattern)];
+        if (matches.length > 0) {
+          const lastMatch = matches[matches.length - 1];
+          splitPoint = lastMatch.index + lastMatch[0].length;
+          break;
+        }
+      }
+      
+      // If no good split point found, use hard limit
+      if (splitPoint === maxLength) {
+        splitPoint = remaining.substring(0, maxLength).lastIndexOf(' ') || maxLength;
+      }
+      
+      const segment = remaining.substring(0, splitPoint).trim();
+      if (segment) {
+        segments.push(segment);
+      }
+      
+      remaining = remaining.substring(splitPoint).trim();
+    }
+    
+    // Add remaining text
+    if (remaining) {
+      segments.push(remaining);
+    }
+    
+    return segments;
+  }
+
   // Translate batch of texts
   async translateBatch(texts, sourceLang = 'auto', targetLang = 'en', projectId = 0) {
-    // Split large batches to avoid API limits
-    const maxBatchSize = 10;
+    // Reduce batch size and control content length to avoid API limits
+    const maxBatchSize = 5;  // Reduced from 10 to 5
+    const maxContentLength = 1000;  // Max characters per text segment
     const results = [];
     
-    for (let i = 0; i < texts.length; i += maxBatchSize) {
-      const batch = texts.slice(i, i + maxBatchSize);
+    // Smart text processing with splitting
+    const processedTexts = [];
+    const textMappings = []; // Track which results belong to which original text
+    
+    for (let i = 0; i < texts.length; i++) {
+      const text = texts[i];
+      if (text.length > maxContentLength) {
+        const segments = this.splitLongText(text, maxContentLength);
+        console.log(`Long text split into ${segments.length} parts (original: ${text.length} chars)`);
+        
+        processedTexts.push(...segments);
+        // Track that the next N results belong to original text i
+        for (let j = 0; j < segments.length; j++) {
+          textMappings.push({ originalIndex: i, partIndex: j, totalParts: segments.length });
+        }
+      } else {
+        processedTexts.push(text);
+        textMappings.push({ originalIndex: i, partIndex: 0, totalParts: 1 });
+      }
+    }
+    
+    const totalBatches = Math.ceil(processedTexts.length / maxBatchSize);
+    console.log(`Processing ${processedTexts.length} texts in ${totalBatches} batches (max ${maxBatchSize} per batch)`);
+    
+    // Translate all processed texts
+    const translatedSegments = [];
+    
+    for (let i = 0; i < processedTexts.length; i += maxBatchSize) {
+      const batch = processedTexts.slice(i, i + maxBatchSize);
+      const currentBatch = Math.floor(i/maxBatchSize) + 1;
+      
+      console.log(`Translating batch ${currentBatch}/${totalBatches} (${batch.length} texts)...`);
       
       const payload = {
         SourceTextList: batch,
@@ -142,20 +226,48 @@ class TencentTranslator {
 
       try {
         const response = await this.makeRequest('TextTranslateBatch', payload);
-        results.push(...response.TargetTextList);
+        translatedSegments.push(...response.TargetTextList);
+        console.log(`Batch ${currentBatch}/${totalBatches} completed successfully`);
         
-        // Add delay between batches to avoid rate limiting
-        if (i + maxBatchSize < texts.length) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
+        // Rate limiting: wait 200ms between batches (max 5 requests per second)
+        if (i + maxBatchSize < processedTexts.length) {
+          console.log('Rate limiting: waiting 200ms...');
+          await new Promise(resolve => setTimeout(resolve, 200));
         }
       } catch (error) {
-        console.error(`Batch translation failed for batch ${Math.floor(i/maxBatchSize) + 1}:`, error.message);
+        console.error(`Batch ${currentBatch}/${totalBatches} translation failed:`, error.message);
         // Add empty translations for failed batch
-        results.push(...new Array(batch.length).fill('[TRANSLATION_FAILED]'));
+        translatedSegments.push(...new Array(batch.length).fill('[TRANSLATION_FAILED]'));
       }
     }
     
-    return results;
+    // Reconstruct original text structure by combining split segments
+    const finalResults = [];
+    const combinedTexts = new Map(); // originalIndex -> combined text
+    
+    for (let i = 0; i < textMappings.length; i++) {
+      const mapping = textMappings[i];
+      const translatedText = translatedSegments[i];
+      
+      if (mapping.totalParts === 1) {
+        // Single part text, add directly
+        finalResults[mapping.originalIndex] = translatedText;
+      } else {
+        // Multi-part text, combine segments
+        if (!combinedTexts.has(mapping.originalIndex)) {
+          combinedTexts.set(mapping.originalIndex, []);
+        }
+        combinedTexts.get(mapping.originalIndex)[mapping.partIndex] = translatedText;
+      }
+    }
+    
+    // Combine multi-part texts
+    for (const [originalIndex, parts] of combinedTexts) {
+      finalResults[originalIndex] = parts.join(' ');
+    }
+    
+    console.log(`Translation completed: ${finalResults.length} texts processed (${translatedSegments.length} segments)`);
+    return finalResults;
   }
 
   // Single text translation (wrapper for batch)
